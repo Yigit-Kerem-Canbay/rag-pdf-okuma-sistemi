@@ -1,0 +1,48 @@
+# Özel bilgiler ve API anahtarları
+.env
+
+# Python cache ve geçici dosyalar
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Sanal ortam
+.venv/
+venv/
+ENV/
+env/
+
+# Chroma veritabanı dosyaları
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE ve editör dosyaları
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# İşletim sistemi dosyaları
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PDF ve TXT test dosyaları (opsiyonel - eğer test dosyalarını da paylaşmak istemiyorsan)
+*.pdf
+*.txt
+
+# Log dosyaları
+*.log
+
+# Geçici dosyalar
+*.tmp
+*.temp
+
