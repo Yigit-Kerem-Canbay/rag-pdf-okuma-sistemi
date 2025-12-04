@@ -10,8 +10,16 @@ from chromadb.config import Settings
 from dotenv import load_dotenv
 import google.generativeai as genai
 import gradio as gr
+import requests
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
+
+# Groq API için (opsiyonel)
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 
 load_dotenv()
@@ -22,8 +30,25 @@ CHUNK_OVERLAP = 150
 DEFAULT_TOP_K = 4
 MMR_LAMBDA = 0.5
 COLLECTION_NAME = "active_pdf"
+DEFAULT_CITY = "Elazığ"
+
+# Türkiye'nin 81 şehri (alfabetik sıralı)
+TURKIYE_SEHIRLERI = [
+    "Adana", "Adıyaman", "Afyonkarahisar", "Ağrı", "Aksaray", "Amasya", "Ankara", "Antalya",
+    "Ardahan", "Artvin", "Aydın", "Balıkesir", "Bartın", "Batman", "Bayburt", "Bilecik",
+    "Bingöl", "Bitlis", "Bolu", "Burdur", "Bursa", "Çanakkale", "Çankırı", "Çorum",
+    "Denizli", "Diyarbakır", "Düzce", "Edirne", "Elazığ", "Erzincan", "Erzurum", "Eskişehir",
+    "Gaziantep", "Giresun", "Gümüşhane", "Hakkari", "Hatay", "Iğdır", "Isparta", "İstanbul",
+    "İzmir", "Kahramanmaraş", "Karabük", "Karaman", "Kars", "Kastamonu", "Kayseri", "Kırıkkale",
+    "Kırklareli", "Kırşehir", "Kilis", "Kocaeli", "Konya", "Kütahya", "Malatya", "Manisa",
+    "Mardin", "Mersin", "Muğla", "Muş", "Nevşehir", "Niğde", "Ordu", "Osmaniye", "Rize",
+    "Sakarya", "Samsun", "Şanlıurfa", "Siirt", "Sinop", "Şırnak", "Sivas", "Tekirdağ",
+    "Tokat", "Trabzon", "Tunceli", "Uşak", "Van", "Yalova", "Yozgat", "Zonguldak"
+]
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
@@ -82,11 +107,33 @@ def get_gemini_model():
     return _gemini_model
 
 
+_groq_client = None
+
+
+def get_groq_client():
+    """Groq API client'ını döndürür"""
+    global _groq_client
+    if not GROQ_AVAILABLE:
+        raise RuntimeError("Groq paketi yüklü değil. 'pip install groq' komutu ile yükleyin.")
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY değerini .env dosyasına ekleyip uygulamayı yeniden başlatın. "
+            "Ücretsiz API anahtarı için: https://console.groq.com/"
+        )
+    if _groq_client is None:
+        _groq_client = Groq(api_key=GROQ_API_KEY)
+    return _groq_client
+
+
 embedder = SentenceTransformer(EMBED_MODEL_NAME)
 chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
 
 active_collection = None
 current_docs: Dict[str, Dict[str, str]] = {}
+
+# Sohbet hafızası - önceki mesajları ve kullanıcı profilini tutar
+conversation_history: List[Dict[str, str]] = []
+user_profile: Dict[str, str] = {}
 
 
 def normalize_text(text: str) -> str:
@@ -99,6 +146,50 @@ def sanitize_question(q: str) -> str:
     for b in blockers:
         q = q.replace(b, f"{b} (mevzuat kapsamında)")
     return q
+
+
+def update_user_profile(message: str) -> None:
+    """
+    Kullanıcının verdiği basit kişisel bilgileri (ör. ad, üşürüm) profilde saklar.
+    Bu bilgiler belgeye bağlı değildir ve belge içinde aranmaz.
+    """
+    global user_profile
+    text = (message or "").strip()
+    lower = text.lower()
+
+    # Ad yakalama: "benim adım X", "adım X", "ismim X"
+    name_patterns = [
+        r"\bbenim ad[ıi]m\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)",
+        r"\bad[ıi]m\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)",
+        r"\bismim\s+([A-Za-zÇĞİÖŞÜçğıöşü]+)",
+    ]
+    import re as _re
+
+    for pat in name_patterns:
+        m = _re.search(pat, text, flags=_re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            # İlk harfi büyük yap, geri kalanı olduğu gibi bırak
+            if name:
+                user_profile["name"] = name[0].upper() + name[1:]
+            break
+
+    # Üşüme / sıcaklık hassasiyeti
+    if "üşürüm" in lower or "çok üşürüm" in lower:
+        user_profile["cold_sensitivity"] = "high"
+
+
+def is_weather_related_question(question: str) -> bool:
+    """Soru hava durumu, aktivite veya kıyafet önerisi ile ilgili mi kontrol eder"""
+    question_lower = question.lower()
+    weather_keywords = [
+        "hava durumu", "hava", "sıcaklık", "yağmur", "kar", "rüzgar", "nem",
+        "aktivite öner", "aktivite", "ne yapabilirim", "ne yapmalıyım",
+        "kıyafet öner", "kıyafet", "giyin", "giyim", "nasıl giyinmeliyim",
+        "bugünkü hava", "şu anki hava", "güncel hava", "hava durumuna göre",
+        "havaya göre", "iklim", "mevsim"
+    ]
+    return any(keyword in question_lower for keyword in weather_keywords)
 
 
 def read_pdf(file_path: str) -> List[Tuple[int, str]]:
@@ -296,35 +387,221 @@ def build_sources(metas: List[Dict]) -> List[str]:
     return unique
 
 
-def call_gemini(context: str, question: str, sources: List[str]) -> str:
+def get_weather_summary(city: str) -> Tuple[bool, str, str]:
+    """
+    OpenWeatherMap'ten hava durumu özetini döndürür.
+
+    Returns:
+        has_weather (bool): Gerçek API verisi başarıyla alındı mı?
+        normalized_city (str): Kullanılan şehir adı
+        summary (str): Kısa Türkçe özet veya hata bilgisi
+    """
+    city = (city or "").strip() or DEFAULT_CITY
+
+    # API anahtarı yoksa akış bozulmasın, sadece belgeye dayanılacağını söyle
+    if not WEATHER_API_KEY:
+        return (
+            False,
+            city,
+            "Hava durumu API anahtarı bulunamadı. Lütfen cevabını sadece belge bağlamına dayandır.",
+        )
+
+    try:
+        params = {
+            "q": city,
+            "appid": WEATHER_API_KEY,
+            "units": "metric",
+            "lang": "tr",
+        }
+        resp = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params=params,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return (
+                False,
+                city,
+                "Hava durumu şu anda alınamıyor. Lütfen cevabını sadece belge bağlamına dayandır.",
+            )
+
+        data = resp.json()
+        weather_list = data.get("weather") or []
+        main = data.get("main") or {}
+        wind = data.get("wind") or {}
+
+        description = (
+            weather_list[0].get("description", "").capitalize()
+            if weather_list
+            else ""
+        )
+        temp = main.get("temp")
+        feels = main.get("feels_like")
+        humidity = main.get("humidity")
+        wind_speed = wind.get("speed")
+
+        parts = []
+        if description:
+            parts.append(description)
+        if temp is not None:
+            parts.append(f"Sıcaklık: {temp:.1f}°C")
+        if feels is not None:
+            parts.append(f"Hissedilen: {feels:.1f}°C")
+        if humidity is not None:
+            parts.append(f"Nem: %{humidity}")
+        if wind_speed is not None:
+            parts.append(f"Rüzgar: {wind_speed:.1f} m/sn")
+
+        if not parts:
+            return (
+                False,
+                city,
+                "Hava durumu verisi alınamadı. Lütfen cevabını sadece belge bağlamına dayandır.",
+            )
+
+        summary = f"{city} için güncel hava durumu: " + ", ".join(parts) + "."
+        return True, city, summary
+    except Exception:
+        # Her türlü hata durumunda sadece belgeye dayanılmasını sağla
+        return (
+            False,
+            city,
+            "Hava durumu servisine ulaşılamadı. Lütfen cevabını sadece belge bağlamına dayandır.",
+        )
+
+
+def format_conversation_history(history: List[Dict[str, str]], max_turns: int = 5) -> str:
+    """Sohbet geçmişini prompt formatına çevirir (son N mesaj)"""
+    if not history:
+        return ""
+    
+    # Son N mesajı al (çok uzun olmasın)
+    recent_history = history[-max_turns:] if len(history) > max_turns else history
+    
+    formatted = []
+    for msg in recent_history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            formatted.append(f"Kullanıcı: {content}")
+        elif role == "assistant":
+            formatted.append(f"Asistan: {content}")
+    
+    if formatted:
+        return "\n".join(formatted)
+    return ""
+
+
+def format_user_profile(profile: Dict[str, str]) -> str:
+    """Kullanıcı profilini (ad, üşüme vb.) prompt için okunur hale getirir."""
+    if not profile:
+        return ""
+    parts = []
+    name = profile.get("name")
+    if name:
+        parts.append(f"Kullanıcının adı: {name}")
+    cold = profile.get("cold_sensitivity")
+    if cold == "high":
+        parts.append("Kullanıcı soğuğa karşı hassastır ve çabuk üşür.")
+    if not parts:
+        return ""
+    return "\n".join(parts)
+
+
+def call_gemini(
+    context: str,
+    question: str,
+    sources: List[str],
+    weather_summary: str,
+    city: str,
+    has_weather: bool,
+    is_weather_question: bool = False,
+    conversation_history: List[Dict[str, str]] = None,
+    profile: Dict[str, str] | None = None,
+) -> str:
     model = get_gemini_model()
     doc_list = ", ".join(sorted(current_docs.keys())) if current_docs else "Belge"
-    prompt = f"""
-Sen bir akademik belge analiz asistanısın.
-Sadece aşağıdaki bağlamda yer alan bilgileri kullan.
-Bağlamda yoksa açıkça "Bu bilgi belgede yer almıyor." de.
-Tahmin, uydurma veya yorum yapma.
 
-ÖNEMLİ: Her bilginin hangi belgeden geldiğini mutlaka belirt!
+    weather_block = f"Hava durumu özeti (şehir: {city}):\n{weather_summary}\n"
+
+    # Kullanıcı profilini formatla (ad, üşüme vb.)
+    profile_text = ""
+    if profile:
+        profile_str = format_user_profile(profile)
+        if profile_str:
+            profile_text = (
+                "\n\nKULLANICI PROFİLİ (belgeden bağımsız, sohbetten öğrenilen):\n"
+                f"{profile_str}\n\n"
+                "ÖNEMLİ:\n"
+                "- Bu bilgiler belge içinde aranmaz; doğrudan doğru kabul edilir.\n"
+                "- Kullanıcı kendi adını veya özelliklerini söylediyse, bunları belge yerine sohbet geçmişine göre kullan.\n"
+            )
+
+    # Önceki sohbet geçmişini formatla
+    history_text = ""
+    if conversation_history:
+        history_text = format_conversation_history(conversation_history, max_turns=5)
+        if history_text:
+            history_text = f"\n\nÖNCEKİ SOHBET GEÇMİŞİ (bağlam için):\n{history_text}\n\nÖNEMLİ: Yukarıdaki önceki mesajları dikkate al ve kullanıcının önceki söylediklerini hatırla. Örneğin kullanıcı 'üşürüm' dediyse, kıyafet önerirken daha sıcak tutan kıyafetler öner."
+
+    # Hava durumu soruları için özel kurallar
+    if is_weather_question and has_weather:
+        weather_rules = """
+ÖNEMLİ - Hava Durumu Sorusu:
+- Bu soru hava durumu, aktivite veya kıyafet önerisi ile ilgilidir.
+- Belge bağlamında hava durumu bilgisi olmasa bile, hava durumu API'sinden gelen bilgiyi kullanabilirsin.
+- Hava durumu API'sinden gelen bilgi (sıcaklık, yağış, rüzgar, nem vb.) bağımsız bir kaynaktır ve PDF'te olmasa bile kullanılabilir.
+- Belge bağlamında hava durumu ile ilgili bilgi yoksa, sadece hava durumu API bilgisine dayanarak pratik tavsiyeler ver.
+- Örnek: "Hava soğuk, kalın giyin" veya "Yağmur bekleniyor, yanınıza şemsiye alın" gibi direkt hava durumuna göre tavsiyeler verebilirsin.
+"""
+    else:
+        weather_rules = """
+- Belge bağlamında olmayan bir bilgiyi "Bu bilgi belgede yer almıyor." diyerek açıkça belirt.
+- Hava durumu bilgisi yoksa veya alınamadıysa cevabını sadece belge bağlamına dayandır.
+"""
+
+    prompt = f"""
+Sen bir akademik belge analiz ve tavsiye asistanısın.
+
+KAYNAKLAR:
+1) Belge bağlamı (PDF/TXT içeriği)
+2) Hava durumu özeti (varsa)
+3) Sohbet geçmişi ve kullanıcı profili (kullanıcının kendisiyle ilgili verdiği bilgiler: ad, üşüme vb.)
+
+Kurallar:
+{weather_rules}
+- Kullanıcının kendisiyle ilgili verdiği kişisel bilgiler (ad, "üşürüm" gibi ifadeler) için bu bilgileri sohbet geçmişi / kullanıcı profilinden kullan; bu bilgiler için belgede geçme şartı YOKTUR.
+- Belge içeriğiyle ilgili sorularda, sadece belge bağlamına dayan ve bağlamda yoksa "Bu bilgi belgede yer almıyor." de.
+- Hava durumu bilgisi varsa ve soruda hava durumu ile ilgili bir istek varsa, cevabında hem belge kurallarına hem de hava durumu özetine dayanarak kısa, pratik bir tavsiye üret.
+- Tahmin, uydurma veya belge/hava durumu/kullanıcı bilgisi dışında yorum yapma.
+
+ÖNEMLİ: Her bilginin hangi kaynaktan geldiğini mutlaka belirt!
+- Belge için: [Kaynak: belge_adı.pdf, Sayfa X]
+- Hava durumu için: [Kaynak: Hava durumu API, Şehir: {city}]
+- Kullanıcı profili veya sohbet geçmişi için: [Kaynak: Kullanıcı profili / Sohbet geçmişi]
 
 Yanıt formatı:
-Sonuç: <tek cümlelik özet> [Kaynak: belge_adı.pdf, Sayfa X]
+Sonuç: <tek cümlelik özet> [Kaynak: ...]
 
 Gerekçe:
-- madde 1 [Kaynak: belge_adı.pdf, Sayfa X]
-- madde 2 [Kaynak: belge_adı2.pdf, Sayfa Y]
-- madde 3 [Kaynak: belge_adı.pdf, Sayfa Z]
+- madde 1 [Kaynak: ...]
+- madde 2 [Kaynak: ...]
+- madde 3 [Kaynak: ...]
 
 Akademik, tarafsız ve bilgilendirici ol.
-- Her bilgi parçasından sonra hangi belgeden geldiğini mutlaka köşeli parantez içinde belirt.
-- Birden fazla belgeden bilgi kullanıyorsan, her belgeyi ayrı ayrı belirt.
+- Her bilgi parçasından sonra hangi belgeden, hava durumundan veya kullanıcı profilinden geldiğini köşeli parantez içinde belirt.
+- Birden fazla belge veya kaynak kullanıyorsan, her birini ayrı ayrı belirt.
 
 Mevcut Belgeler: {doc_list}
 
-Bağlam (her parça hangi belgeden geldiğini gösterir):
+Belge Bağlamı (her parça hangi belgeden geldiğini gösterir):
 {context}
 
-Soru:
+Hava Durumu Bağlamı:
+{weather_block}
+{profile_text}
+{history_text}
+Kullanıcının Sorusu:
 {question}
 """
     try:
@@ -457,11 +734,196 @@ Türkçe, kısa ve bilgilendirici cevap:
             for page_info in sources_by_doc[doc_name]:
                 formatted_sources.append(f"  • {page_info}")
         
-        text = f"{text.strip()}\n\n📚 Kaynaklar:{''.join(formatted_sources)}"
+        text = f"{text.strip()}\n\n📚 Kaynaklar (Belge):{''.join(formatted_sources)}"
+
+        # Hava durumu kaynağını da ekle
+        if has_weather:
+            text = f"{text}\n\n🌤 Hava Durumu Kaynağı:\n  • OpenWeatherMap API (Şehir: {city})"
+
     return text
 
 
-def answer_question(message, history, top_k, use_mmr):
+def call_groq(
+    context: str,
+    question: str,
+    sources: List[str],
+    weather_summary: str,
+    city: str,
+    has_weather: bool,
+    is_weather_question: bool = False,
+    conversation_history: List[Dict[str, str]] = None,
+    profile: Dict[str, str] | None = None,
+) -> str:
+    """Groq API kullanarak LLM çağrısı yapar (güvenlik filtreleri yok, çok hızlı)"""
+    try:
+        client = get_groq_client()
+        doc_list = ", ".join(sorted(current_docs.keys())) if current_docs else "Belge"
+
+        weather_block = f"Hava durumu özeti (şehir: {city}):\n{weather_summary}\n"
+
+        # Kullanıcı profilini formatla (ad, üşüme vb.)
+        profile_text = ""
+        if profile:
+            profile_str = format_user_profile(profile)
+            if profile_str:
+                profile_text = (
+                    "\n\nKULLANICI PROFİLİ (belgeden bağımsız, sohbetten öğrenilen):\n"
+                    f"{profile_str}\n\n"
+                    "ÖNEMLİ:\n"
+                    "- Bu bilgiler belge içinde aranmaz; doğrudan doğru kabul edilir.\n"
+                    "- Kullanıcı kendi adını veya özelliklerini söylediyse, bunları belge yerine sohbet geçmişine göre kullan.\n"
+                )
+
+        # Önceki sohbet geçmişini formatla
+        history_text = ""
+        if conversation_history:
+            history_text = format_conversation_history(conversation_history, max_turns=5)
+            if history_text:
+                history_text = f"\n\nÖNCEKİ SOHBET GEÇMİŞİ (bağlam için):\n{history_text}\n\nÖNEMLİ: Yukarıdaki önceki mesajları dikkate al ve kullanıcının önceki söylediklerini hatırla. Örneğin kullanıcı 'üşürüm' dediyse, kıyafet önerirken daha sıcak tutan kıyafetler öner."
+
+        # Hava durumu soruları için özel kurallar
+        if is_weather_question and has_weather:
+            weather_rules = """
+ÖNEMLİ - Hava Durumu Sorusu:
+- Bu soru hava durumu, aktivite veya kıyafet önerisi ile ilgilidir.
+- Belge bağlamında hava durumu bilgisi olmasa bile, hava durumu API'sinden gelen bilgiyi kullanabilirsin.
+- Hava durumu API'sinden gelen bilgi (sıcaklık, yağış, rüzgar, nem vb.) bağımsız bir kaynaktır ve PDF'te olmasa bile kullanılabilir.
+- Belge bağlamında hava durumu ile ilgili bilgi yoksa, sadece hava durumu API bilgisine dayanarak pratik tavsiyeler ver.
+- Örnek: "Hava soğuk, kalın giyin" veya "Yağmur bekleniyor, yanınıza şemsiye alın" gibi direkt hava durumuna göre tavsiyeler verebilirsin.
+"""
+        else:
+            weather_rules = """
+- Belge bağlamında olmayan bir bilgiyi "Bu bilgi belgede yer almıyor." diyerek açıkça belirt.
+- Hava durumu bilgisi yoksa veya alınamadıysa cevabını sadece belge bağlamına dayandır.
+"""
+
+        prompt = f"""Sen bir akademik belge analiz ve tavsiye asistanısın.
+
+KAYNAKLAR:
+1) Belge bağlamı (PDF/TXT içeriği)
+2) Hava durumu özeti (varsa)
+3) Sohbet geçmişi ve kullanıcı profili (kullanıcının kendisiyle ilgili verdiği bilgiler: ad, üşürüm vb.)
+
+Kurallar:
+{weather_rules}
+- Kullanıcının kendisiyle ilgili verdiği kişisel bilgiler (ad, "üşürüm" gibi ifadeler) için bu bilgileri sohbet geçmişi / kullanıcı profilinden kullan; bu bilgiler için belgede geçme şartı YOKTUR.
+- Belge içeriğiyle ilgili sorularda, sadece belge bağlamına dayan ve bağlamda yoksa "Bu bilgi belgede yer almıyor." de.
+- Hava durumu bilgisi varsa ve soruda hava durumu ile ilgili bir istek varsa, cevabında hem belge kurallarına hem de hava durumu özetine dayanarak kısa, pratik bir tavsiye üret.
+- Tahmin, uydurma veya belge/hava durumu/kullanıcı bilgisi dışında yorum yapma.
+
+ÖNEMLİ: Her bilginin hangi kaynaktan geldiğini mutlaka belirt!
+- Belge için: [Kaynak: belge_adı.pdf, Sayfa X]
+- Hava durumu için: [Kaynak: Hava durumu API, Şehir: {city}]
+- Kullanıcı profili veya sohbet geçmişi için: [Kaynak: Kullanıcı profili / Sohbet geçmişi]
+
+Yanıt formatı:
+Sonuç: <tek cümlelik özet> [Kaynak: ...]
+
+Gerekçe:
+- madde 1 [Kaynak: ...]
+- madde 2 [Kaynak: ...]
+- madde 3 [Kaynak: ...]
+
+Akademik, tarafsız ve bilgilendirici ol.
+- Her bilgi parçasından sonra hangi belgeden, hava durumundan veya kullanıcı profilinden geldiğini köşeli parantez içinde belirt.
+- Birden fazla belge veya kaynak kullanıyorsan, her birini ayrı ayrı belirt.
+
+Mevcut Belgeler: {doc_list}
+
+Belge Bağlamı (her parça hangi belgeden geldiğini gösterir):
+{context}
+
+Hava Durumu Bağlamı:
+{weather_block}
+{profile_text}
+{history_text}
+
+Kullanıcının Sorusu:
+{question}
+"""
+
+        # Groq API çağrısı - Güncel model listesi (eski model kullanımdan kaldırıldı)
+        # Model adayları: önce en güçlü olanı dene
+        model_candidates = [
+            "llama-3.3-70b-versatile",      # Yeni versiyon (önerilen)
+            "llama-3.1-70b-versatile",      # Eski (fallback)
+            "llama-3.1-8b-instant",         # Daha hızlı ama küçük
+            "mixtral-8x7b-32768",           # Uzun bağlam
+            "gemma2-9b-it",                 # Google'ın modeli
+        ]
+        
+        chat_completion = None
+        last_error = None
+        
+        for model_name in model_candidates:
+            try:
+                chat_completion = client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Sen Türkçe konuşan, akademik belge analiz ve tavsiye konusunda uzman bir asistansın. Her zaman kaynak belirtmeyi unutma."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    model=model_name,
+                    temperature=0.3,
+                    max_tokens=1024,
+                )
+                # Başarılı oldu, döngüden çık
+                break
+            except Exception as e:
+                last_error = e
+                # Bu model çalışmadı, bir sonrakini dene
+                continue
+        
+        if chat_completion is None:
+            raise RuntimeError(f"Hiçbir Groq modeli çalışmadı. Son hata: {last_error}")
+
+        text = chat_completion.choices[0].message.content.strip()
+
+        if not text:
+            text = "Üzgünüm, modelden yanıt alınamadı."
+
+    except Exception as e:
+        text = f"⚠️ Groq API Hatası: {str(e)}"
+
+    # Kaynakları ekle (aynı format)
+    if "Kaynaklar:" not in text and sources:
+        sources_by_doc = {}
+        for src in sources:
+            if "📄" in src:
+                parts = src.split("|")
+                doc_name = parts[0].replace("📄", "").strip()
+                page_info = parts[1].strip() if len(parts) > 1 else ""
+                chunk_info = parts[2].strip() if len(parts) > 2 else ""
+            else:
+                doc_name = "Bilinmeyen"
+                page_info = src
+            
+            if doc_name not in sources_by_doc:
+                sources_by_doc[doc_name] = []
+            sources_by_doc[doc_name].append(f"{page_info} {chunk_info}".strip())
+        
+        formatted_sources = []
+        for doc_name in sorted(sources_by_doc.keys()):
+            formatted_sources.append(f"\n📄 {doc_name}:")
+            for page_info in sources_by_doc[doc_name]:
+                formatted_sources.append(f"  • {page_info}")
+        
+        text = f"{text.strip()}\n\n📚 Kaynaklar (Belge):{''.join(formatted_sources)}"
+
+    # Hava durumu kaynağını da ekle
+    if has_weather:
+        text = f"{text}\n\n🌤 Hava Durumu Kaynağı:\n  • OpenWeatherMap API (Şehir: {city})"
+
+    return text
+
+
+def answer_question(message, city, history, top_k, use_mmr, model_choice):
+    global conversation_history, user_profile
     history = history or []
     if not message:
         return history, history, ""
@@ -470,14 +932,55 @@ def answer_question(message, history, top_k, use_mmr):
         reply = "Önce bir PDF/TXT yükleyip indeks oluşturmalısın."
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": reply})
+        # Hafızaya da ekle
+        conversation_history.append({"role": "user", "content": message})
+        conversation_history.append({"role": "assistant", "content": reply})
         return history, history, ""
 
     try:
-        message = sanitize_question(message)
+        # Önce kullanıcı profilini güncelle (ad, üşüme vb.)
+        update_user_profile(message)
 
-        documents, metadatas = retrieve_chunks(message, top_k=int(top_k), use_mmr=bool(use_mmr))
+        message = sanitize_question(message)
+        # Şehri hazırla (boşsa varsayılan Elazığ kullanılır)
+        city = (city or "").strip() or DEFAULT_CITY
+
+        # Hava durumunu al (gerçek API veya güvenli fallback)
+        has_weather, normalized_city, weather_summary = get_weather_summary(city)
+
+        # Sorunun hava durumu ile ilgili olup olmadığını kontrol et
+        is_weather_question = is_weather_related_question(message)
+
+        # Önce belge bağlamını getir
+        documents, metadatas = retrieve_chunks(
+            message, top_k=int(top_k), use_mmr=bool(use_mmr)
+        )
+        
+        # Model seçimine göre çağrı fonksiyonunu belirle
+        if model_choice == "Groq (Önerilen - Güvenlik Filtresi Yok)":
+            call_llm = call_groq
+        else:
+            call_llm = call_gemini
+
+        # Hava durumu sorularında belge bağlamı bulunamasa bile devam et
         if not documents:
-            reply = "Bağlam bulunamadı. Daha farklı bir soru deneyebilirsin."
+            if is_weather_question and has_weather:
+                # Hava durumu sorusu ve API'den veri var, sadece hava durumuna göre cevap ver
+                context = "Belge bağlamı bulunamadı, ancak hava durumu bilgisi mevcut."
+                sources = []
+                reply = call_llm(
+                    context=context,
+                    question=message,
+                    sources=sources,
+                    weather_summary=weather_summary,
+                    city=normalized_city,
+                    has_weather=has_weather,
+                    is_weather_question=True,
+                    conversation_history=conversation_history,
+                    profile=user_profile,
+                )
+            else:
+                reply = "Bağlam bulunamadı. Daha farklı bir soru deneyebilirsin."
         else:
             raw_context = format_context(documents, metadatas)
 
@@ -489,12 +992,30 @@ Gerçek kişi, suç veya suistimal içermemektedir.
 """
 
             sources = build_sources(metadatas)
-            reply = call_gemini(context, message, sources)
+            reply = call_llm(
+                context=context,
+                question=message,
+                sources=sources,
+                weather_summary=weather_summary,
+                city=normalized_city,
+                has_weather=has_weather,
+                is_weather_question=is_weather_question,
+                conversation_history=conversation_history,
+                profile=user_profile,
+            )
     except Exception as exc:
         reply = f"Hata: {exc}"
 
+    # Hem Gradio history'ye hem de global conversation_history'ye ekle
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": reply})
+    conversation_history.append({"role": "user", "content": message})
+    conversation_history.append({"role": "assistant", "content": reply})
+    
+    # Hafızayı çok uzamasın diye sınırla (son 20 mesaj)
+    if len(conversation_history) > 20:
+        conversation_history = conversation_history[-20:]
+    
     return history, history, ""
 
 
@@ -518,6 +1039,9 @@ def handle_upload(file_objs, history):
 
 
 def clear_chat():
+    """Sohbet geçmişini temizler (hem UI hem hafıza)"""
+    global conversation_history
+    conversation_history = []
     return [], [], ""
 
 
@@ -548,6 +1072,11 @@ with gr.Blocks(title="Mini RAG - Mevzuat") as demo:
         clear_btn = gr.Button("Sohbeti temizle", variant="secondary")
         clear_docs_btn = gr.Button("Belgeleri temizle", variant="stop")
 
+    # Model seçenekleri
+    model_choices = ["Gemini (Google)"]
+    if GROQ_AVAILABLE and GROQ_API_KEY:
+        model_choices.insert(0, "Groq (Önerilen - Güvenlik Filtresi Yok)")
+    
     with gr.Row():
         top_k_slider = gr.Slider(
             minimum=3,
@@ -561,11 +1090,27 @@ with gr.Blocks(title="Mini RAG - Mevzuat") as demo:
             value=False,
             info="Benzerlik + çeşitlilik dengesi sağlar",
         )
+        model_choice = gr.Dropdown(
+            label="LLM Modeli",
+            choices=model_choices,
+            value=model_choices[0],
+            info="Groq: Güvenlik filtresi yok, hızlı. Gemini: Google'ın modeli (bazen filtreler)",
+        )
 
-    question_box = gr.Textbox(
-        label="Sorunuzu yazın",
-        placeholder="Örn. 'Belgede gizlilik kuralı ne?'",
-    )
+    with gr.Row():
+        question_box = gr.Textbox(
+            label="Sorunuzu yazın",
+            placeholder="Örn. 'Belgede gizlilik kuralı ne?' veya 'Bugünkü hava durumuna göre ne önerirsin?'",
+            scale=3,
+        )
+        city_box = gr.Dropdown(
+            label="Şehir (hava durumu için)",
+            choices=TURKIYE_SEHIRLERI,
+            value=DEFAULT_CITY,
+            allow_custom_value=True,
+            scale=1,
+            info="Türkiye'nin 81 şehrinden birini seçin veya yazın",
+        )
 
     file_input.upload(
         fn=handle_upload,
@@ -575,7 +1120,7 @@ with gr.Blocks(title="Mini RAG - Mevzuat") as demo:
 
     question_box.submit(
         fn=answer_question,
-        inputs=[question_box, history_state, top_k_slider, mmr_checkbox],
+        inputs=[question_box, city_box, history_state, top_k_slider, mmr_checkbox, model_choice],
         outputs=[chatbot, history_state, question_box],
     )
 
